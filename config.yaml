@@ -1,0 +1,61 @@
+# AXIOM Gateway Configuration File
+
+gateway:
+  host: "127.0.0.1"
+  port: 8080
+  # AXIOM Admin API Key for accessing the gateway itself and viewing dashboard analytics
+  admin_api_key: "axiom_admin_secret_key_2026"
+
+rate_limiting:
+  enabled: true
+  # Token bucket capacity (number of requests that can be handled in a burst)
+  burst_capacity: 10
+  # Rate limit fill rate (number of tokens added to bucket per minute)
+  tokens_per_minute: 60
+
+providers:
+  openai:
+    base_url: "https://api.openai.com/v1"
+    api_keys:
+      - "sk-proj-PLACEHOLDER_OPENAI_KEY_HERE"
+    circuit_breaker:
+      # Number of consecutive failures before tripping the circuit to Open
+      failure_threshold: 5
+      # Time in seconds to wait in Open state before attempting auto-healing
+      cooldown_seconds: 30
+
+  anthropic:
+    base_url: "https://api.anthropic.com"
+    api_keys:
+      - "sk-ant-PLACEHOLDER_ANTHROPIC_KEY_HERE"
+    circuit_breaker:
+      failure_threshold: 5
+      cooldown_seconds: 30
+
+  gemini:
+    # Use standard Google AI Studio endpoint
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    api_keys:
+      - "AIzaSy-PLACEHOLDER_GEMINI_KEY_HERE"
+    circuit_breaker:
+      failure_threshold: 3
+      cooldown_seconds: 15
+
+routing:
+  # The default policy when no model routing override is requested
+  # Options: cost_aware, latency_aware, load_balanced, direct
+  default_policy: "cost_aware"
+  
+  # Custom fallback chains when a primary model encounters issues or is blocked
+  fallback_chains:
+    gpt-4o:
+      - "gpt-4o"
+      - "claude-3-5-sonnet"
+      - "gemini-1.5-pro"
+    claude-3-5-sonnet:
+      - "claude-3-5-sonnet"
+      - "gpt-4o"
+      - "gemini-1.5-pro"
+    gemini-1.5-flash:
+      - "gemini-1.5-flash"
+      - "gpt-4o-mini"
