@@ -44,7 +44,7 @@ providers:
 routing:
   # The default policy when no model routing override is requested
   # Options: cost_aware, latency_aware, load_balanced, direct
-  default_policy: "cost_aware"
+  default_policy: "latency_aware"
   
   # Custom fallback chains when a primary model encounters issues or is blocked
   fallback_chains:
