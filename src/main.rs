@@ -19,6 +19,7 @@ mod proxy;
 mod rate_limiter;
 mod circuit_breaker;
 mod router;
+mod telemetry;
 
 use crate::config::AppConfig;
 use crate::proxy::{
@@ -38,6 +39,7 @@ struct AppState {
     rate_limiter: RateLimiter,
     circuit_breakers: HashMap<String, CircuitBreaker>,
     router: router::SmartRouter,
+    telemetry_tx: tokio::sync::mpsc::UnboundedSender<telemetry::TelemetryRecord>,
 }
 
 #[tokio::main]
@@ -106,12 +108,17 @@ async fn main() {
     let latency_tracker = router::LatencyTracker::new();
     let smart_router = router::SmartRouter::new(latency_tracker);
 
+    // Initialize Asynchronous Telemetry Stack
+    let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(telemetry::start_telemetry_worker(telemetry_rx, "telemetry.db".to_string()));
+
     let shared_state = Arc::new(AppState {
         config,
         client,
         rate_limiter,
         circuit_breakers,
         router: smart_router,
+        telemetry_tx,
     });
 
     // Build the Axum router
@@ -123,7 +130,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("CRITICAL: Failed to bind TCP listener on port {}: {}", port, e));
 
-    info!("✓ AXIOM Phase 4 Gateway Server Active & Listening!");
+    info!("✓ AXIOM Phase 5 Gateway Server Active & Listening!");
 
     axum::serve(listener, app)
         .await
@@ -163,6 +170,9 @@ async fn handle_chat_completions(
         ).into_response();
     }
 
+    // Estimate prompt size for cost estimation
+    let prompt_chars: usize = payload.messages.iter().map(|m| m.content.len()).sum();
+
     // ── Step 3: Resolve Primary Route and Failover Chain ──
     let default_policy = &state.config.routing.default_policy;
     let (primary_model, primary_provider) = state.router.resolve_route(&payload, default_policy);
@@ -184,6 +194,7 @@ async fn handle_chat_completions(
     info!("Routing attempts list: {:?}", attempts);
 
     let mut errors = Vec::new();
+    let start_time = std::time::Instant::now();
 
     // ── Step 4: Dispatch Request Loop with Automatic Failover ──
     for (model, provider) in attempts {
@@ -223,19 +234,36 @@ async fn handle_chat_completions(
             model, provider, payload.stream.unwrap_or(false)
         );
 
-        let start_time = std::time::Instant::now();
+        let attempt_start = std::time::Instant::now();
 
         if payload.stream.unwrap_or(false) {
             match proxy_driver.proxy_stream(&state.client, provider_config, &attempt_payload).await {
                 Ok(stream) => {
                     // Record success & latency (TTFT)
-                    let elapsed = start_time.elapsed().as_millis() as f64;
+                    let elapsed = attempt_start.elapsed().as_millis() as f64;
                     state.router.latency_tracker.record_latency(&provider, elapsed);
                     if let Some(cb) = state.circuit_breakers.get(&provider) {
                         cb.record_success();
                     }
 
-                    let sse_stream = stream.map(move |res| {
+                    // Prepare template telemetry record
+                    let record_template = telemetry::TelemetryRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        status_code: 200,
+                        latency_ms: 0,
+                        ttft_ms: Some(elapsed as u64),
+                        prompt_tokens: (prompt_chars as f64 / 4.0).ceil() as u32,
+                        completion_tokens: 0,
+                        estimated_cost: 0.0,
+                    };
+
+                    // Wrap stream with dynamic telemetry metrics collector
+                    let telemetry_stream = telemetry::TelemetryStream::new(stream, record_template, state.telemetry_tx.clone());
+
+                    let sse_stream = telemetry_stream.map(move |res| {
                         match res {
                             Ok(line) => {
                                 if line.starts_with("data:") {
@@ -273,11 +301,31 @@ async fn handle_chat_completions(
             match proxy_driver.proxy_json(&state.client, provider_config, &attempt_payload).await {
                 Ok(response) => {
                     // Record success & latency
-                    let elapsed = start_time.elapsed().as_millis() as f64;
+                    let elapsed = attempt_start.elapsed().as_millis() as f64;
                     state.router.latency_tracker.record_latency(&provider, elapsed);
                     if let Some(cb) = state.circuit_breakers.get(&provider) {
                         cb.record_success();
                     }
+
+                    // Record telemetry metrics
+                    let completion_chars: usize = response.choices.iter().map(|c| c.message.content.len()).sum();
+                    let (prompt_tokens, completion_tokens, estimated_cost) = 
+                        telemetry::calculate_estimated_cost(&model, prompt_chars, completion_chars);
+
+                    let record = telemetry::TelemetryRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                        provider: provider.clone(),
+                        model: model.clone(),
+                        status_code: StatusCode::OK.as_u16(),
+                        latency_ms: start_time.elapsed().as_millis() as u64,
+                        ttft_ms: None,
+                        prompt_tokens,
+                        completion_tokens,
+                        estimated_cost,
+                    };
+                    let _ = state.telemetry_tx.send(record);
+
                     return Json(response).into_response();
                 }
                 Err(e) => {
@@ -298,7 +346,21 @@ async fn handle_chat_completions(
         }
     }
 
-    // All routes failed
+    // All routes failed — log failure telemetry record in DB
+    let record = telemetry::TelemetryRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        timestamp: chrono::Utc::now().timestamp(),
+        provider: primary_provider.clone(),
+        model: primary_model.clone(),
+        status_code: StatusCode::BAD_GATEWAY.as_u16(),
+        latency_ms: start_time.elapsed().as_millis() as u64,
+        ttft_ms: None,
+        prompt_tokens: (prompt_chars as f64 / 4.0).ceil() as u32,
+        completion_tokens: 0,
+        estimated_cost: 0.0,
+    };
+    let _ = state.telemetry_tx.send(record);
+
     error!("All routing and fallback attempts failed! Errors: {:?}", errors);
     (
         StatusCode::BAD_GATEWAY,
