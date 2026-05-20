@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Async Runtime & Concurrency
 tokio = { version = "1.38", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 
 # Web Framework & HTTP Server
@@ -34,3 +34,4 @@ uuid = { version = "1.8", features = ["v4", "serde"] }
 
 # Embedded Assets (To statically compile our React SPA directly into our single binary)
 rust-embed = { version = "8.4", features = ["axum"] }
+mime_guess = "2.0"

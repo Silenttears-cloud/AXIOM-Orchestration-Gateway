@@ -13,6 +13,8 @@ use axum::{
 use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 use futures_util::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+use tower_http::cors::CorsLayer;
 
 mod config;
 mod proxy;
@@ -40,6 +42,7 @@ struct AppState {
     circuit_breakers: HashMap<String, CircuitBreaker>,
     router: router::SmartRouter,
     telemetry_tx: tokio::sync::mpsc::UnboundedSender<telemetry::TelemetryRecord>,
+    telemetry_broadcast: tokio::sync::broadcast::Sender<telemetry::TelemetryRecord>,
 }
 
 #[tokio::main]
@@ -108,9 +111,15 @@ async fn main() {
     let latency_tracker = router::LatencyTracker::new();
     let smart_router = router::SmartRouter::new(latency_tracker);
 
-    // Initialize Asynchronous Telemetry Stack
+    // Initialize Asynchronous Telemetry Stack & Real-Time Broadcast
     let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(telemetry::start_telemetry_worker(telemetry_rx, "telemetry.db".to_string()));
+    let (telemetry_broadcast, _) = tokio::sync::broadcast::channel(100);
+    
+    tokio::spawn(telemetry::start_telemetry_worker(
+        telemetry_rx, 
+        "telemetry.db".to_string(), 
+        telemetry_broadcast.clone()
+    ));
 
     let shared_state = Arc::new(AppState {
         config,
@@ -119,11 +128,22 @@ async fn main() {
         circuit_breakers,
         router: smart_router,
         telemetry_tx,
+        telemetry_broadcast,
     });
+
+    // CORS configurations for dashboard frontend
+    let cors = CorsLayer::permissive();
 
     // Build the Axum router
     let app = Router::new()
         .route("/v1/chat/completions", post(handle_chat_completions))
+        .route("/v1/telemetry/stream", axum::routing::get(handle_telemetry_stream))
+        .route("/v1/telemetry/history", axum::routing::get(handle_get_telemetry_history))
+        .route("/v1/circuit-breakers", axum::routing::get(handle_get_circuit_breakers))
+        .route("/v1/circuit-breakers/:provider/reset", post(handle_reset_circuit_breaker))
+        .route("/dashboard", axum::routing::get(serve_dashboard))
+        .route("/dashboard/*path", axum::routing::get(serve_dashboard))
+        .layer(cors)
         .with_state(shared_state);
 
     let listener = tokio::net::TcpListener::bind(format!("{}:{}", host, port))
@@ -366,4 +386,134 @@ async fn handle_chat_completions(
         StatusCode::BAD_GATEWAY,
         format!("All routing attempts failed. Details:\n- {}", errors.join("\n- "))
     ).into_response()
+}
+
+/// SSE Real-time Telemetry Stream Endpoint
+async fn handle_telemetry_stream(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let rx = state.telemetry_broadcast.subscribe();
+    let stream = BroadcastStream::new(rx).map(|res| {
+        match res {
+            Ok(record) => {
+                if let Ok(json_str) = serde_json::to_string(&record) {
+                    Ok::<_, Infallible>(Event::default().data(json_str))
+                } else {
+                    Ok::<_, Infallible>(Event::default().data("{}"))
+                }
+            }
+            Err(e) => {
+                warn!("Telemetry stream lagging or skipped: {}", e);
+                Ok::<_, Infallible>(Event::default().event("error").data(e.to_string()))
+            }
+        }
+    });
+
+    Sse::new(stream).into_response()
+}
+
+/// GET /v1/telemetry/history
+async fn handle_get_telemetry_history(
+    State(_state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let db_path = "telemetry.db".to_string();
+    let records_res = tokio::task::spawn_blocking(move || {
+        telemetry::get_recent_records(&db_path, 100)
+    }).await;
+
+    match records_res {
+        Ok(Ok(records)) => (StatusCode::OK, Json(records)).into_response(),
+        Ok(Err(e)) => {
+            error!("Database telemetry history query failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Database query error").into_response()
+        }
+        Err(e) => {
+            error!("Blocking task join failed for telemetry history: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "Thread join error").into_response()
+        }
+    }
+}
+
+/// GET /v1/circuit-breakers
+async fn handle_get_circuit_breakers(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let mut cb_states = HashMap::new();
+    for (name, cb) in &state.circuit_breakers {
+        cb_states.insert(name.clone(), serde_json::json!({
+            "state": cb.get_state(),
+            "failure_count": cb.failure_count(),
+        }));
+    }
+    Json(cb_states)
+}
+
+/// POST /v1/circuit-breakers/:provider/reset
+async fn handle_reset_circuit_breaker(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(provider): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    if let Some(cb) = state.circuit_breakers.get(&provider) {
+        cb.record_success(); // Resets the circuit breaker and opens flow
+        info!("Manual Override: Reset circuit breaker for provider '{}' to CLOSED", provider);
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "success",
+                "message": format!("Circuit breaker for '{}' reset to CLOSED successfully", provider)
+            }))
+        ).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "status": "error",
+                "message": format!("Provider '{}' not found in active configurations", provider)
+            }))
+        ).into_response()
+    }
+}
+
+// Embedded Static Assets
+#[derive(rust_embed::RustEmbed)]
+#[folder = "dashboard-ui/dist/"]
+struct Assets;
+
+/// Serve Embedded Dashboard SPA with HTML5 routing fallback
+async fn serve_dashboard(uri: axum::http::Uri) -> impl IntoResponse {
+    let path_str = uri.path();
+    let mut path = path_str.trim_start_matches('/');
+    
+    // Trim dashboard prefix if it's there
+    if path.starts_with("dashboard") {
+        path = &path["dashboard".len()..];
+    }
+    let mut path = path.trim_start_matches('/');
+
+    if path.is_empty() || path == "/" {
+        path = "index.html";
+    }
+
+    match Assets::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            axum::response::Response::builder()
+                .header(axum::http::header::CONTENT_TYPE, mime.as_ref())
+                .body(axum::body::Body::from(content.data))
+                .unwrap()
+        }
+        None => {
+            // SPA fallback routing
+            match Assets::get("index.html") {
+                Some(content) => axum::response::Response::builder()
+                    .header(axum::http::header::CONTENT_TYPE, "text/html")
+                    .body(axum::body::Body::from(content.data))
+                    .unwrap(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    "Embedded Dashboard Asset index.html was not found"
+                ).into_response(),
+            }
+        }
+    }
 }

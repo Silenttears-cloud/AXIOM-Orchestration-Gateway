@@ -203,6 +203,7 @@ fn flush_batch(conn: &mut Connection, batch: &mut Vec<TelemetryRecord>) -> Resul
 pub async fn start_telemetry_worker(
     mut rx: UnboundedReceiver<TelemetryRecord>,
     db_path: String,
+    broadcast_tx: tokio::sync::broadcast::Sender<TelemetryRecord>,
 ) {
     info!("Starting telemetry background worker...");
     let mut conn = match Connection::open(&db_path) {
@@ -240,6 +241,9 @@ pub async fn start_telemetry_worker(
         };
 
         if let Some(record) = msg {
+            // Broadcast the record to all live SSE subscribers
+            let _ = broadcast_tx.send(record.clone());
+            
             batch.push(record);
             if batch.len() >= 10 {
                 if let Err(e) = flush_batch(&mut conn, &mut batch) {
@@ -263,6 +267,35 @@ pub async fn start_telemetry_worker(
         }
     }
     info!("Telemetry background worker shut down gracefully.");
+}
+
+/// Query recent telemetry records from the database
+pub fn get_recent_records(db_path: &str, limit: usize) -> Result<Vec<TelemetryRecord>, rusqlite::Error> {
+    let conn = Connection::open(db_path)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, timestamp, provider, model, status_code, latency_ms, ttft_ms, prompt_tokens, completion_tokens, estimated_cost
+         FROM metrics ORDER BY timestamp DESC LIMIT ?"
+    )?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok(TelemetryRecord {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            provider: row.get(2)?,
+            model: row.get(3)?,
+            status_code: row.get(4)?,
+            latency_ms: row.get(5)?,
+            ttft_ms: row.get(6)?,
+            prompt_tokens: row.get(7)?,
+            completion_tokens: row.get(8)?,
+            estimated_cost: row.get(9)?,
+        })
+    })?;
+
+    let mut records = Vec::new();
+    for r in rows {
+        records.push(r?);
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
