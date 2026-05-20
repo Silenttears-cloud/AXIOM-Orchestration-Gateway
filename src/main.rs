@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use axum::{
     routing::post,
@@ -9,12 +10,14 @@ use axum::{
     response::sse::{Event, Sse},
     response::IntoResponse,
 };
-use tracing::{info, error, Level};
+use tracing::{info, warn, error, Level};
 use tracing_subscriber::FmtSubscriber;
 use futures_util::StreamExt;
 
 mod config;
 mod proxy;
+mod rate_limiter;
+mod circuit_breaker;
 
 use crate::config::AppConfig;
 use crate::proxy::{
@@ -24,11 +27,15 @@ use crate::proxy::{
     anthropic::AnthropicProxy,
     gemini::GeminiProxy,
 };
+use crate::rate_limiter::RateLimiter;
+use crate::circuit_breaker::CircuitBreaker;
 
 /// Shared Application State
 struct AppState {
     config: AppConfig,
     client: reqwest::Client,
+    rate_limiter: RateLimiter,
+    circuit_breakers: HashMap<String, CircuitBreaker>,
 }
 
 #[tokio::main]
@@ -60,7 +67,34 @@ async fn main() {
     info!("Registered AI Providers: {:?}", active_providers);
     info!("Active Routing Policy: '{}'", config.routing.default_policy);
 
-    // Initialize reqwest HTTP client with pooled connections for max performance
+    // Initialize Rate Limiter from config
+    let rate_limiter = RateLimiter::new(
+        config.rate_limiting.burst_capacity,
+        config.rate_limiting.tokens_per_minute,
+    );
+    info!(
+        "Rate Limiter Initialized: [Burst: {}, Refill: {}/min]",
+        config.rate_limiting.burst_capacity,
+        config.rate_limiting.tokens_per_minute
+    );
+
+    // Initialize per-provider Circuit Breakers from config
+    let mut circuit_breakers = HashMap::new();
+    for (name, provider_cfg) in &config.providers {
+        let cb = CircuitBreaker::new(
+            provider_cfg.circuit_breaker.failure_threshold,
+            provider_cfg.circuit_breaker.cooldown_seconds,
+        );
+        info!(
+            "Circuit Breaker [{}]: [Threshold: {}, Cooldown: {}s]",
+            name,
+            provider_cfg.circuit_breaker.failure_threshold,
+            provider_cfg.circuit_breaker.cooldown_seconds
+        );
+        circuit_breakers.insert(name.clone(), cb);
+    }
+
+    // Initialize reqwest HTTP client with pooled connections
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(10)
         .build()
@@ -69,6 +103,8 @@ async fn main() {
     let shared_state = Arc::new(AppState {
         config,
         client,
+        rate_limiter,
+        circuit_breakers,
     });
 
     // Build the Axum router
@@ -80,7 +116,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("CRITICAL: Failed to bind TCP listener on port {}: {}", port, e));
 
-    info!("✓ AXIOM Phase 2 Gateway Server Active & Listening!");
+    info!("✓ AXIOM Phase 3 Gateway Server Active & Listening!");
 
     axum::serve(listener, app)
         .await
@@ -93,7 +129,7 @@ async fn handle_chat_completions(
     headers: HeaderMap,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
-    // 1. Authenticate Request
+    // ── Step 1: Authenticate Request ──
     let auth_header = match headers.get("authorization") {
         Some(value) => match value.to_str() {
             Ok(str_val) => str_val,
@@ -104,11 +140,23 @@ async fn handle_chat_completions(
 
     let expected_auth = format!("Bearer {}", state.config.gateway.admin_api_key);
     if auth_header != expected_auth {
-        error!("Unauthorized access attempt! Expected admin_api_key validation.");
+        error!("Unauthorized access attempt!");
         return (StatusCode::UNAUTHORIZED, "Unauthorized admin_api_key").into_response();
     }
 
-    // 2. Select Upstream Provider dynamically based on requested model
+    // ── Step 2: Rate Limit Check ──
+    if state.config.rate_limiting.enabled && !state.rate_limiter.try_acquire() {
+        warn!(
+            "Rate limit exceeded! Available tokens: {:.1}",
+            state.rate_limiter.available_tokens()
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded. Please slow down."
+        ).into_response();
+    }
+
+    // ── Step 3: Route to Provider ──
     let model_lower = payload.model.to_lowercase();
     let provider_name = if model_lower.contains("gpt") {
         "openai"
@@ -117,19 +165,29 @@ async fn handle_chat_completions(
     } else if model_lower.contains("gemini") {
         "gemini"
     } else {
-        // Fallback to the first available provider configured
         state.config.providers.keys().next().map(|s| s.as_str()).unwrap_or("openai")
     };
 
     let provider_config = match state.config.providers.get(provider_name) {
         Some(cfg) => cfg,
         None => return (
-            StatusCode::BAD_REQUEST, 
-            format!("The routed provider '{}' is not configured in config.yaml", provider_name)
+            StatusCode::BAD_REQUEST,
+            format!("Provider '{}' is not configured", provider_name)
         ).into_response(),
     };
 
-    // Instantiate respective proxy driver dynamically
+    // ── Step 4: Circuit Breaker Check ──
+    if let Some(cb) = state.circuit_breakers.get(provider_name) {
+        if let Err(msg) = cb.check() {
+            warn!("Circuit breaker OPEN for provider '{}': {}", provider_name, msg);
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("Provider '{}' is temporarily unavailable. {}", provider_name, msg)
+            ).into_response();
+        }
+    }
+
+    // Instantiate proxy driver
     let proxy_driver: Box<dyn ProviderProxy + Send + Sync> = match provider_name {
         "openai" => Box::new(OpenAIProxy),
         "anthropic" => Box::new(AnthropicProxy),
@@ -138,20 +196,22 @@ async fn handle_chat_completions(
     };
 
     info!(
-        "Routing LLM request: [Model: {}] -> [Provider: {}] -> [Streaming: {}]", 
-        payload.model, 
-        provider_name, 
-        payload.stream.unwrap_or(false)
+        "Routing: [{}] -> [{}] [Stream: {}]",
+        payload.model, provider_name, payload.stream.unwrap_or(false)
     );
 
-    // 3. Dispatch to Stream Proxy or JSON Proxy
+    // ── Step 5: Dispatch Request ──
     if payload.stream.unwrap_or(false) {
         match proxy_driver.proxy_stream(&state.client, provider_config, &payload).await {
             Ok(stream) => {
+                // Record success on circuit breaker
+                if let Some(cb) = state.circuit_breakers.get(provider_name) {
+                    cb.record_success();
+                }
+
                 let sse_stream = stream.map(|res| {
                     match res {
                         Ok(line) => {
-                            // Extract standard SSE data content if line starts with "data:"
                             if line.starts_with("data:") {
                                 let content = line["data:".len()..].trim().to_string();
                                 Ok::<_, Infallible>(Event::default().data(content))
@@ -169,15 +229,39 @@ async fn handle_chat_completions(
                 Sse::new(sse_stream).into_response()
             }
             Err(e) => {
-                error!("Upstream stream request failed: {}", e);
+                // Record failure on circuit breaker
+                if let Some(cb) = state.circuit_breakers.get(provider_name) {
+                    cb.record_failure();
+                    warn!(
+                        "Circuit breaker [{}]: failure #{} / threshold {}",
+                        provider_name, cb.failure_count(), 
+                        provider_config.circuit_breaker.failure_threshold
+                    );
+                }
+                error!("Upstream stream failed: {}", e);
                 (StatusCode::BAD_GATEWAY, format!("Upstream stream failed: {}", e)).into_response()
             }
         }
     } else {
         match proxy_driver.proxy_json(&state.client, provider_config, &payload).await {
-            Ok(response) => Json(response).into_response(),
+            Ok(response) => {
+                // Record success on circuit breaker
+                if let Some(cb) = state.circuit_breakers.get(provider_name) {
+                    cb.record_success();
+                }
+                Json(response).into_response()
+            }
             Err(e) => {
-                error!("Upstream JSON request failed: {}", e);
+                // Record failure on circuit breaker
+                if let Some(cb) = state.circuit_breakers.get(provider_name) {
+                    cb.record_failure();
+                    warn!(
+                        "Circuit breaker [{}]: failure #{} / threshold {}",
+                        provider_name, cb.failure_count(),
+                        provider_config.circuit_breaker.failure_threshold
+                    );
+                }
+                error!("Upstream JSON failed: {}", e);
                 (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {}", e)).into_response()
             }
         }
