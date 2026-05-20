@@ -18,6 +18,7 @@ mod config;
 mod proxy;
 mod rate_limiter;
 mod circuit_breaker;
+mod router;
 
 use crate::config::AppConfig;
 use crate::proxy::{
@@ -36,6 +37,7 @@ struct AppState {
     client: reqwest::Client,
     rate_limiter: RateLimiter,
     circuit_breakers: HashMap<String, CircuitBreaker>,
+    router: router::SmartRouter,
 }
 
 #[tokio::main]
@@ -100,11 +102,16 @@ async fn main() {
         .build()
         .expect("Failed to build HTTP Client");
 
+    // Initialize Latency Tracker & Smart Router
+    let latency_tracker = router::LatencyTracker::new();
+    let smart_router = router::SmartRouter::new(latency_tracker);
+
     let shared_state = Arc::new(AppState {
         config,
         client,
         rate_limiter,
         circuit_breakers,
+        router: smart_router,
     });
 
     // Build the Axum router
@@ -116,7 +123,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("CRITICAL: Failed to bind TCP listener on port {}: {}", port, e));
 
-    info!("✓ AXIOM Phase 3 Gateway Server Active & Listening!");
+    info!("✓ AXIOM Phase 4 Gateway Server Active & Listening!");
 
     axum::serve(listener, app)
         .await
@@ -156,114 +163,145 @@ async fn handle_chat_completions(
         ).into_response();
     }
 
-    // ── Step 3: Route to Provider ──
-    let model_lower = payload.model.to_lowercase();
-    let provider_name = if model_lower.contains("gpt") {
-        "openai"
-    } else if model_lower.contains("claude") {
-        "anthropic"
-    } else if model_lower.contains("gemini") {
-        "gemini"
-    } else {
-        state.config.providers.keys().next().map(|s| s.as_str()).unwrap_or("openai")
-    };
+    // ── Step 3: Resolve Primary Route and Failover Chain ──
+    let default_policy = &state.config.routing.default_policy;
+    let (primary_model, primary_provider) = state.router.resolve_route(&payload, default_policy);
 
-    let provider_config = match state.config.providers.get(provider_name) {
-        Some(cfg) => cfg,
-        None => return (
-            StatusCode::BAD_REQUEST,
-            format!("Provider '{}' is not configured", provider_name)
-        ).into_response(),
-    };
+    // Build the fallback chain
+    let mut attempts = vec![(primary_model.clone(), primary_provider.clone())];
 
-    // ── Step 4: Circuit Breaker Check ──
-    if let Some(cb) = state.circuit_breakers.get(provider_name) {
-        if let Err(msg) = cb.check() {
-            warn!("Circuit breaker OPEN for provider '{}': {}", provider_name, msg);
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("Provider '{}' is temporarily unavailable. {}", provider_name, msg)
-            ).into_response();
+    // If there is a fallback chain configured for the originally requested model, append those options
+    if let Some(chain) = state.config.routing.fallback_chains.get(&payload.model) {
+        for fallback_model in chain {
+            let fallback_provider = router::SmartRouter::get_provider_for_model(fallback_model);
+            // Avoid duplicate attempts
+            if !attempts.iter().any(|(m, p)| m == fallback_model && p == &fallback_provider) {
+                attempts.push((fallback_model.clone(), fallback_provider));
+            }
         }
     }
 
-    // Instantiate proxy driver
-    let proxy_driver: Box<dyn ProviderProxy + Send + Sync> = match provider_name {
-        "openai" => Box::new(OpenAIProxy),
-        "anthropic" => Box::new(AnthropicProxy),
-        "gemini" => Box::new(GeminiProxy),
-        _ => Box::new(OpenAIProxy),
-    };
+    info!("Routing attempts list: {:?}", attempts);
 
-    info!(
-        "Routing: [{}] -> [{}] [Stream: {}]",
-        payload.model, provider_name, payload.stream.unwrap_or(false)
-    );
+    let mut errors = Vec::new();
 
-    // ── Step 5: Dispatch Request ──
-    if payload.stream.unwrap_or(false) {
-        match proxy_driver.proxy_stream(&state.client, provider_config, &payload).await {
-            Ok(stream) => {
-                // Record success on circuit breaker
-                if let Some(cb) = state.circuit_breakers.get(provider_name) {
-                    cb.record_success();
-                }
+    // ── Step 4: Dispatch Request Loop with Automatic Failover ──
+    for (model, provider) in attempts {
+        let provider_config = match state.config.providers.get(&provider) {
+            Some(cfg) => cfg,
+            None => {
+                let err_msg = format!("Provider '{}' is not configured for model '{}'", provider, model);
+                warn!("{}", err_msg);
+                errors.push(err_msg);
+                continue;
+            }
+        };
 
-                let sse_stream = stream.map(|res| {
-                    match res {
-                        Ok(line) => {
-                            if line.starts_with("data:") {
-                                let content = line["data:".len()..].trim().to_string();
-                                Ok::<_, Infallible>(Event::default().data(content))
-                            } else {
-                                Ok::<_, Infallible>(Event::default().data(line))
+        // Check Circuit Breaker
+        if let Some(cb) = state.circuit_breakers.get(&provider) {
+            if let Err(msg) = cb.check() {
+                let err_msg = format!("Circuit breaker OPEN for provider '{}' (model '{}'): {}", provider, model, msg);
+                warn!("{}", err_msg);
+                errors.push(err_msg);
+                continue; // Tripped! Failover to next candidate
+            }
+        }
+
+        // Instantiate proxy driver
+        let proxy_driver: Box<dyn ProviderProxy + Send + Sync> = match provider.as_str() {
+            "openai" => Box::new(OpenAIProxy),
+            "anthropic" => Box::new(AnthropicProxy),
+            "gemini" => Box::new(GeminiProxy),
+            _ => Box::new(OpenAIProxy),
+        };
+
+        let mut attempt_payload = payload.clone();
+        attempt_payload.model = model.clone();
+
+        info!(
+            "Attempting route: [{}] -> [{}] [Stream: {}]",
+            model, provider, payload.stream.unwrap_or(false)
+        );
+
+        let start_time = std::time::Instant::now();
+
+        if payload.stream.unwrap_or(false) {
+            match proxy_driver.proxy_stream(&state.client, provider_config, &attempt_payload).await {
+                Ok(stream) => {
+                    // Record success & latency (TTFT)
+                    let elapsed = start_time.elapsed().as_millis() as f64;
+                    state.router.latency_tracker.record_latency(&provider, elapsed);
+                    if let Some(cb) = state.circuit_breakers.get(&provider) {
+                        cb.record_success();
+                    }
+
+                    let sse_stream = stream.map(move |res| {
+                        match res {
+                            Ok(line) => {
+                                if line.starts_with("data:") {
+                                    let content = line["data:".len()..].trim().to_string();
+                                    Ok::<_, Infallible>(Event::default().data(content))
+                                } else {
+                                    Ok::<_, Infallible>(Event::default().data(line))
+                                }
+                            }
+                            Err(e) => {
+                                error!("Stream chunk error: {}", e);
+                                Ok::<_, Infallible>(Event::default().event("error").data(e))
                             }
                         }
-                        Err(e) => {
-                            error!("Stream chunk error: {}", e);
-                            Ok::<_, Infallible>(Event::default().event("error").data(e))
-                        }
-                    }
-                });
+                    });
 
-                Sse::new(sse_stream).into_response()
-            }
-            Err(e) => {
-                // Record failure on circuit breaker
-                if let Some(cb) = state.circuit_breakers.get(provider_name) {
-                    cb.record_failure();
-                    warn!(
-                        "Circuit breaker [{}]: failure #{} / threshold {}",
-                        provider_name, cb.failure_count(), 
-                        provider_config.circuit_breaker.failure_threshold
-                    );
+                    return Sse::new(sse_stream).into_response();
                 }
-                error!("Upstream stream failed: {}", e);
-                (StatusCode::BAD_GATEWAY, format!("Upstream stream failed: {}", e)).into_response()
-            }
-        }
-    } else {
-        match proxy_driver.proxy_json(&state.client, provider_config, &payload).await {
-            Ok(response) => {
-                // Record success on circuit breaker
-                if let Some(cb) = state.circuit_breakers.get(provider_name) {
-                    cb.record_success();
+                Err(e) => {
+                    // Record failure on circuit breaker
+                    if let Some(cb) = state.circuit_breakers.get(&provider) {
+                        cb.record_failure();
+                        warn!(
+                            "Circuit breaker [{}]: failure #{} / threshold {}",
+                            provider, cb.failure_count(), 
+                            provider_config.circuit_breaker.failure_threshold
+                        );
+                    }
+                    let err_msg = format!("Upstream stream failed for model '{}' on provider '{}': {}", model, provider, e);
+                    error!("{}", err_msg);
+                    errors.push(err_msg);
                 }
-                Json(response).into_response()
             }
-            Err(e) => {
-                // Record failure on circuit breaker
-                if let Some(cb) = state.circuit_breakers.get(provider_name) {
-                    cb.record_failure();
-                    warn!(
-                        "Circuit breaker [{}]: failure #{} / threshold {}",
-                        provider_name, cb.failure_count(),
-                        provider_config.circuit_breaker.failure_threshold
-                    );
+        } else {
+            match proxy_driver.proxy_json(&state.client, provider_config, &attempt_payload).await {
+                Ok(response) => {
+                    // Record success & latency
+                    let elapsed = start_time.elapsed().as_millis() as f64;
+                    state.router.latency_tracker.record_latency(&provider, elapsed);
+                    if let Some(cb) = state.circuit_breakers.get(&provider) {
+                        cb.record_success();
+                    }
+                    return Json(response).into_response();
                 }
-                error!("Upstream JSON failed: {}", e);
-                (StatusCode::BAD_GATEWAY, format!("Upstream request failed: {}", e)).into_response()
+                Err(e) => {
+                    // Record failure on circuit breaker
+                    if let Some(cb) = state.circuit_breakers.get(&provider) {
+                        cb.record_failure();
+                        warn!(
+                            "Circuit breaker [{}]: failure #{} / threshold {}",
+                            provider, cb.failure_count(),
+                            provider_config.circuit_breaker.failure_threshold
+                        );
+                    }
+                    let err_msg = format!("Upstream JSON failed for model '{}' on provider '{}': {}", model, provider, e);
+                    error!("{}", err_msg);
+                    errors.push(err_msg);
+                }
             }
         }
     }
+
+    // All routes failed
+    error!("All routing and fallback attempts failed! Errors: {:?}", errors);
+    (
+        StatusCode::BAD_GATEWAY,
+        format!("All routing attempts failed. Details:\n- {}", errors.join("\n- "))
+    ).into_response()
 }
