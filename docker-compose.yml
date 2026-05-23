@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  axiom-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: axiom-gateway
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Direct AXIOM to store the telemetry database inside the mounted persistent data volume
+      - AXIOM_DB_PATH=/app/data/telemetry.db
+    volumes:
+      # Bind mount config.yaml from host to container to allow editing API keys dynamically on the host
+      - ./config.yaml:/app/config.yaml
+      # Mount persistent directory for the SQLite telemetry database and WAL files
+      - ./data:/app/data

@@ -115,11 +115,13 @@ async fn main() {
     let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel();
     let (telemetry_broadcast, _) = tokio::sync::broadcast::channel(100);
     
+    let db_path = std::env::var("AXIOM_DB_PATH").unwrap_or_else(|_| "telemetry.db".to_string());
     tokio::spawn(telemetry::start_telemetry_worker(
         telemetry_rx, 
-        "telemetry.db".to_string(), 
+        db_path, 
         telemetry_broadcast.clone()
     ));
+
 
     let shared_state = Arc::new(AppState {
         config,
@@ -416,7 +418,8 @@ async fn handle_telemetry_stream(
 async fn handle_get_telemetry_history(
     State(_state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let db_path = "telemetry.db".to_string();
+    let db_path = std::env::var("AXIOM_DB_PATH").unwrap_or_else(|_| "telemetry.db".to_string());
+
     let records_res = tokio::task::spawn_blocking(move || {
         telemetry::get_recent_records(&db_path, 100)
     }).await;

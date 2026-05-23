@@ -1,0 +1,21 @@
+# Git and IDE configs
+.git
+.gitignore
+.gemini
+.vscode
+.idea
+
+# Build artifacts
+target/
+dashboard-ui/node_modules/
+dashboard-ui/dist/
+
+# Local databases and runtime state
+telemetry.db*
+data/
+scratch/
+*.log
+
+# Docker templates
+Dockerfile
+docker-compose.yml

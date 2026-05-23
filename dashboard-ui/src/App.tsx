@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { 
   Activity, 
   Database, 
+  Download,
+  FileText,
   Flame, 
   Key, 
   Play, 
@@ -11,6 +13,7 @@ import {
   ShieldAlert, 
   Zap 
 } from 'lucide-react';
+
 
 interface TelemetryRecord {
   id: string;
@@ -343,7 +346,167 @@ export default function App() {
     }
   };
 
+  // Export Telemetry Ledger to CSV Format
+  const handleExportCSV = () => {
+    if (logs.length === 0) {
+      alert("No telemetry records available to export.");
+      return;
+    }
+
+    const headers = [
+      "Timestamp",
+      "Request UUID",
+      "Provider",
+      "Model",
+      "Latency (ms)",
+      "TTFT (ms)",
+      "Prompt Tokens",
+      "Completion Tokens",
+      "Total Tokens",
+      "Estimated Cost ($)",
+      "Status Code"
+    ];
+
+    const rows = logs.map(log => [
+      new Date(log.timestamp * 1000).toISOString(),
+      log.id,
+      log.provider,
+      log.model,
+      log.latency_ms,
+      log.ttft_ms !== null ? log.ttft_ms : "N/A",
+      log.prompt_tokens,
+      log.completion_tokens,
+      log.prompt_tokens + log.completion_tokens,
+      log.estimated_cost.toFixed(6),
+      log.status_code
+    ]);
+
+    const csvContent = "data:text/csv;charset=utf-8," 
+      + [headers.join(","), ...rows.map(e => e.map(val => `"${val}"`).join(","))].join("\n");
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", `axiom_telemetry_ledger_${Date.now()}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
+  // Export Telemetry Ledger to Premium Styled PDF Print Sheet
+  const handleExportPDF = () => {
+    if (logs.length === 0) {
+      alert("No telemetry records available to export.");
+      return;
+    }
+
+    const printWindow = window.open("", "_blank");
+    if (!printWindow) {
+      alert("Please allow popups to generate the PDF ledger report.");
+      return;
+    }
+
+    const dateStr = new Date().toLocaleString();
+    const rowsHtml = logs.map(log => `
+      <tr>
+        <td>${new Date(log.timestamp * 1000).toLocaleTimeString()}</td>
+        <td style="font-family: monospace; font-size: 0.8rem;">${log.id}</td>
+        <td style="text-transform: uppercase; font-weight: bold;">${log.provider}</td>
+        <td><span style="background: #f1f5f9; padding: 2px 6px; border-radius: 4px; font-size: 0.8rem;">${log.model}</span></td>
+        <td>${log.latency_ms}ms</td>
+        <td>${log.ttft_ms ? `${log.ttft_ms}ms` : '—'}</td>
+        <td>${log.prompt_tokens + log.completion_tokens}</td>
+        <td style="color: #16a34a; font-family: monospace;">$${log.estimated_cost.toFixed(6)}</td>
+        <td><span style="font-weight: bold; color: ${log.status_code === 200 ? '#16a34a' : '#dc2626'}">${log.status_code}</span></td>
+      </tr>
+    `).join("");
+
+    printWindow.document.write(`
+      <html>
+        <head>
+          <title>AXIOM Telemetry Analytics Ledger Report</title>
+          <style>
+            body { font-family: 'Inter', system-ui, -apple-system, sans-serif; color: #1e293b; padding: 40px; line-height: 1.5; }
+            .header { border-bottom: 2px solid #e2e8f0; padding-bottom: 20px; margin-bottom: 30px; display: flex; justify-content: space-between; align-items: flex-end; }
+            .header h1 { margin: 0; font-size: 1.8rem; letter-spacing: -0.05em; color: #0f172a; }
+            .meta-group { display: flex; gap: 20px; margin-bottom: 30px; }
+            .meta-card { flex: 1; border: 1px solid #e2e8f0; border-radius: 8px; padding: 16px; background: #f8fafc; }
+            .meta-card .label { font-size: 0.75rem; text-transform: uppercase; color: #64748b; font-weight: 600; margin-bottom: 4px; }
+            .meta-card .value { font-size: 1.5rem; font-weight: 700; color: #0f172a; }
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+            th, td { text-align: left; padding: 12px; border-bottom: 1px solid #e2e8f0; font-size: 0.85rem; }
+            th { background: #f8fafc; font-weight: 600; color: #475569; }
+            .footer { margin-top: 50px; border-top: 1px solid #e2e8f0; padding-top: 20px; font-size: 0.75rem; color: #94a3b8; text-align: center; }
+            @media print {
+              body { padding: 0; }
+              button { display: none; }
+            }
+          </style>
+        </head>
+        <body>
+          <div class="header">
+            <div>
+              <h1>AXIOM // SYSTEM OPERATOR REPORT</h1>
+              <div style="font-size: 0.85rem; color: #64748b; margin-top: 4px;">Gateway Real-time Audit Ledger</div>
+            </div>
+            <div style="font-size: 0.85rem; color: #64748b; text-align: right;">Generated: ${dateStr}</div>
+          </div>
+
+          <div class="meta-group">
+            <div class="meta-card">
+              <div class="label">Total Logs</div>
+              <div class="value">${totalRequests}</div>
+            </div>
+            <div class="meta-card">
+              <div class="label">Dynamic Savings</div>
+              <div class="value">$${costSavings.toFixed(5)}</div>
+            </div>
+            <div class="meta-card">
+              <div class="label">Avg Latency</div>
+              <div class="value">${avgLatency}ms</div>
+            </div>
+            <div class="meta-card">
+              <div class="label">Success Rate</div>
+              <div class="value">${successRate}%</div>
+            </div>
+          </div>
+
+          <table>
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Request UUID</th>
+                <th>Provider</th>
+                <th>Model</th>
+                <th>Latency</th>
+                <th>TTFT</th>
+                <th>Tokens</th>
+                <th>Cost</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rowsHtml}
+            </tbody>
+          </table>
+
+          <div class="footer">
+            AXIOM AI Agent Orchestration Gateway • Secure Production Telemetry Stream Ledger
+          </div>
+
+          <script>
+            window.onload = function() {
+              window.print();
+            };
+          </script>
+        </body>
+      </html>
+    `);
+    printWindow.document.close();
+  };
+
   // Metric Calculation Utilities
+
   const totalRequests = logs.length;
   const avgLatency = logs.length > 0
     ? Math.round(logs.reduce((acc, curr) => acc + curr.latency_ms, 0) / logs.length)
@@ -700,8 +863,27 @@ export default function App() {
           <h2 className="cyber-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <Database size={16} style={{ color: 'var(--neon-cyan)' }} /> Gateway Analytics Transaction Ledger
           </h2>
-          <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>LIVE METRICS LOG (MAX 100 RECORDS)</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>LIVE METRICS LOG (MAX 100 RECORDS)</span>
+            <button 
+              onClick={handleExportCSV} 
+              className="cyber-button" 
+              style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 8px', fontSize: '0.75rem' }}
+              title="Export ledger as CSV"
+            >
+              <Download size={12} /> EXPORT CSV
+            </button>
+            <button 
+              onClick={handleExportPDF} 
+              className="cyber-button" 
+              style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '4px 8px', fontSize: '0.75rem' }}
+              title="Export ledger as PDF report"
+            >
+              <FileText size={12} /> EXPORT PDF
+            </button>
+          </div>
         </div>
+
 
         <div className="logs-table-wrapper">
           <table className="logs-table">
