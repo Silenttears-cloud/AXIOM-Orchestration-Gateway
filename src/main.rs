@@ -60,12 +60,39 @@ async fn main() {
     info!("============================================================");
 
     // Load configuration
-    let config = AppConfig::load("config.yaml")
+    let mut config = AppConfig::load("config.yaml")
         .expect("CRITICAL: Failed to load or validate config.yaml");
     info!("Successfully parsed configuration file!");
 
-    let host = config.gateway.host.clone();
-    let port = config.gateway.port;
+    // Override API keys from Environment Variables if present (for secure production deployment)
+    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+        if let Some(provider) = config.providers.get_mut("openai") {
+            provider.api_keys = vec![key];
+            info!("OpenAI API key overridden from environment variable.");
+        }
+    }
+    if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+        if let Some(provider) = config.providers.get_mut("gemini") {
+            provider.api_keys = vec![key];
+            info!("Gemini API key overridden from environment variable.");
+        }
+    }
+    if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+        if let Some(provider) = config.providers.get_mut("anthropic") {
+            provider.api_keys = vec![key];
+            info!("Anthropic API key overridden from environment variable.");
+        }
+    }
+
+    // Override host & port for container/cloud environments (e.g. Render dynamic ports)
+    let host = std::env::var("HOST")
+        .unwrap_or_else(|_| "0.0.0.0".to_string());
+    
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(config.gateway.port);
+
 
     info!("Gateway Server Bind: http://{}:{}", host, port);
     info!("Rate Limiting Status: [Enabled: {}]", config.rate_limiting.enabled);
