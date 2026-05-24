@@ -12,7 +12,8 @@ RUN npm run build
 # ==============================================================================
 # STAGE 2: Build the Rust Backend Binary
 # ==============================================================================
-FROM rust:1.78 AS backend-builder
+FROM rust:latest AS backend-builder
+
 WORKDIR /usr/src/axiom-gateway
 COPY Cargo.toml Cargo.lock ./
 COPY src/ ./src/
